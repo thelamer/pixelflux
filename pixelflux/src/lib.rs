@@ -247,6 +247,37 @@ fn push_layer_elements<R>(
     }
 }
 
+/// The buffer a display is rendered into and a hardware encoder reads in place: one plane, for
+/// rendering. Intel's video processor, converting to 4:2:0, reads a linear surface at a pitch
+/// rounded up to 64 bytes whatever pitch its import declares, and Mesa gives a linear buffer
+/// allocated for rendering alone the pitch of its width, so a width that is no multiple of 16
+/// reaches the encoder sheared. A buffer the display engine may scan out carries that engine's
+/// aligned pitch, so a linear allocation whose pitch is not a multiple of 64 is made again for
+/// scanout as well, and that one is kept only where it came out aligned.
+pub(crate) fn alloc_render_target<T: std::os::fd::AsFd>(
+    gbm: &RawGbmDevice<T>,
+    width: u32,
+    height: u32,
+    format: GbmFormat,
+) -> std::io::Result<BufferObject<()>> {
+    let aligned = |bo: &BufferObject<()>| {
+        Into::<u64>::into(bo.modifier()) != 0 || bo.stride().is_multiple_of(64)
+    };
+    let bo = gbm.create_buffer_object::<()>(width, height, format, BufferObjectFlags::RENDERING)?;
+    if aligned(&bo) {
+        return Ok(bo);
+    }
+    match gbm.create_buffer_object::<()>(
+        width,
+        height,
+        format,
+        BufferObjectFlags::RENDERING | BufferObjectFlags::SCANOUT,
+    ) {
+        Ok(scanout) if aligned(&scanout) => Ok(scanout),
+        _ => Ok(bo),
+    }
+}
+
 /// Export the offscreen GBM render target as a Dmabuf so the very same GPU pixels can be both
 /// rendered into and encoded with no intervening copy — the linchpin of the zero-copy capture path.
 /// The returned dmabuf is the one handle the GLES renderer binds as its framebuffer AND a hardware
@@ -2065,12 +2096,7 @@ fn start_capture_on_display(
             let mut gbm_resize_failed = false;
             if state.use_gpu
                 && let Some(gbm) = state.gbm_device.as_mut() {
-                    match gbm.create_buffer_object(
-                        settings.width as u32,
-                        settings.height as u32,
-                        GbmFormat::Argb8888,
-                        BufferObjectFlags::RENDERING,
-                    ) {
+                    match alloc_render_target(gbm, settings.width as u32, settings.height as u32, GbmFormat::Argb8888) {
                         Ok(bo) => {
                             let dmabuf = create_dmabuf_from_bo(&bo);
                             new_offscreen = Some((bo, dmabuf));
@@ -2160,12 +2186,7 @@ fn start_capture_on_display(
             .map(|(bo, _)| (bo.width() as i32, bo.height() as i32));
         if have != Some((settings.width, settings.height))
             && let Some(gbm) = state.gbm_device.as_mut() {
-                match gbm.create_buffer_object(
-                    settings.width as u32,
-                    settings.height as u32,
-                    GbmFormat::Argb8888,
-                    BufferObjectFlags::RENDERING,
-                ) {
+                match alloc_render_target(gbm, settings.width as u32, settings.height as u32, GbmFormat::Argb8888) {
                     Ok(bo) => {
                         let dmabuf = create_dmabuf_from_bo(&bo);
                         node.offscreen_buffer = Some((bo, dmabuf));
@@ -3819,12 +3840,7 @@ fn create_output_on(
     let mut offscreen = None;
     if state.use_gpu {
         let Some(gbm) = state.gbm_device.as_mut() else { return false };
-        match gbm.create_buffer_object(
-            width as u32,
-            height as u32,
-            GbmFormat::Argb8888,
-            BufferObjectFlags::RENDERING,
-        ) {
+        match alloc_render_target(gbm, width as u32, height as u32, GbmFormat::Argb8888) {
             Ok(bo) => {
                 let dmabuf = create_dmabuf_from_bo(&bo);
                 offscreen = Some((bo, dmabuf));
@@ -4164,12 +4180,7 @@ fn resize_output_on(
     let mut new_offscreen = None;
     if state.use_gpu {
         let Some(gbm) = state.gbm_device.as_mut() else { return false };
-        match gbm.create_buffer_object(
-            width as u32,
-            height as u32,
-            GbmFormat::Argb8888,
-            BufferObjectFlags::RENDERING,
-        ) {
+        match alloc_render_target(gbm, width as u32, height as u32, GbmFormat::Argb8888) {
             Ok(bo) => {
                 let dmabuf = create_dmabuf_from_bo(&bo);
                 new_offscreen = Some((bo, dmabuf));
@@ -4263,12 +4274,7 @@ fn create_view_on(
     let mut offscreen = None;
     if state.use_gpu {
         let Some(gbm) = state.gbm_device.as_mut() else { return false };
-        match gbm.create_buffer_object(
-            width as u32,
-            height as u32,
-            GbmFormat::Argb8888,
-            BufferObjectFlags::RENDERING,
-        ) {
+        match alloc_render_target(gbm, width as u32, height as u32, GbmFormat::Argb8888) {
             Ok(bo) => {
                 let dmabuf = create_dmabuf_from_bo(&bo);
                 offscreen = Some((bo, dmabuf));
@@ -4522,9 +4528,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 dmabuf_state.create_global::<AppState>(&dh, formats)
             });
 
-            let bo = gbm_allocator.create_buffer_object(
-                width as u32, height as u32, GbmFormat::Argb8888, BufferObjectFlags::RENDERING
-            ).map_err(|_| "Failed to allocate GBM buffer")?;
+            let bo = alloc_render_target(&gbm_allocator, width as u32, height as u32, GbmFormat::Argb8888)
+                .map_err(|_| "Failed to allocate GBM buffer")?;
 
             let dmabuf = create_dmabuf_from_bo(&bo);
             offscreen_buffer = Some((bo, dmabuf));

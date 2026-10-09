@@ -230,6 +230,78 @@ type VaDestroyConfig = unsafe extern "C" fn(*mut c_void, u32) -> c_int;
 type VaMaxNum = unsafe extern "C" fn(*mut c_void) -> c_int;
 type VaQueryConfigProfiles = unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) -> c_int;
 type VaQueryConfigEntrypoints = unsafe extern "C" fn(*mut c_void, c_int, *mut c_int, *mut c_int) -> c_int;
+type VaQueryVendorString = unsafe extern "C" fn(*mut c_void) -> *const c_char;
+type VaGetConfigAttributes =
+    unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut VaConfigAttrib, c_int) -> c_int;
+/// `VAConfigAttrib`, the attribute of a profile and entry point `vaGetConfigAttributes` fills.
+#[repr(C)]
+struct VaConfigAttrib {
+    type_: c_int,
+    value: u32,
+}
+/// `VAConfigAttribEncSliceStructure`, and the structures of its value under which FFmpeg
+/// cuts a picture into the slices asked for: any other structure it cuts a slice a row.
+const VA_CONFIG_ATTRIB_ENC_SLICE_STRUCTURE: c_int = 15;
+const VA_ENC_SLICE_STRUCTURE_POWER_OF_TWO_ROWS: u32 = 0x1;
+const VA_ENC_SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS: u32 = 0x2;
+const VA_ENC_SLICE_STRUCTURE_ARBITRARY_ROWS: u32 = 0x10;
+const VA_ATTRIB_NOT_SUPPORTED: u32 = 0x8000_0000;
+/// `VAConfigAttribRateControl`, and the modes of its value a constant-rate session may open in.
+const VA_CONFIG_ATTRIB_RATE_CONTROL: c_int = 5;
+const VA_RC_VBR: u32 = 0x4;
+const VA_RC_QVBR: u32 = 0x400;
+
+/// How a constant-rate session is driven: as the constant rate asked for, or on a driver whose
+/// constant rate skips a still screen (`VaapiSession::starves_in_a_small_buffer`), as the
+/// quality-targeted variable rate under the same ceiling, else the plain variable rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConstantRate {
+    Cbr,
+    Vbr,
+    Qvbr,
+}
+/// The slices an H.264 or HEVC picture is cut into where the driver cuts as asked.
+const SLICES: c_int = 4;
+
+/// A coded frame without the zero bytes a driver's constant rate pads it with (iHD fills an
+/// H.264 or HEVC frame up to the target after the last slice: a still 1080p screen at 8 Mbit/s
+/// came out as 92 bytes of slice and 16586 zeros on an Arc A750). Trailing zero bytes are no
+/// part of a NAL unit, whose last byte carries the stop bit, so what is cut was never picture.
+fn strip_zero_padding(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |at| at + 1);
+    &bytes[..end]
+}
+
+/// The driver's vendor string on `display`, empty where libva does not say.
+unsafe fn vendor_string(lib: &Library, display: *mut c_void) -> String {
+    let Ok(query) = lib.get::<VaQueryVendorString>(b"vaQueryVendorString\0") else {
+        return String::new();
+    };
+    let text = query(display);
+    if text.is_null() {
+        return String::new();
+    }
+    CStr::from_ptr(text).to_string_lossy().into_owned()
+}
+
+/// Whether the render node at `path` is an Intel part whose low-power H.264 encoder walks a
+/// picture once, top to bottom, wherever its slices are cut: Skylake and Broxton, told by the
+/// PCI device the kernel names, since their drivers list the entry point, and iHD a slice
+/// structure, as they do for the later parts that code the cut. A picture of four slices came
+/// out corrupt below the first there (HD 530), and whole from the full entry point.
+fn whole_picture_vdenc(path: &str) -> bool {
+    let node = std::path::Path::new(path).file_name().and_then(|n| n.to_str());
+    let id = |name: &str| {
+        let text = std::fs::read_to_string(format!("/sys/class/drm/{}/device/{name}", node?)).ok()?;
+        u32::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+    };
+    id("vendor") == Some(0x8086) && id("device").is_some_and(skylake_or_broxton)
+}
+
+/// Whether an Intel PCI device id is a Skylake or a Broxton part's.
+fn skylake_or_broxton(device: u32) -> bool {
+    matches!(device, 0x1900..=0x19ff | 0x0a84 | 0x1a84 | 0x1a85 | 0x5a84 | 0x5a85)
+}
 
 /// The 4:4:4 surface formats to try on this VA device, in `FULLCOLOR_SW_FORMATS` order: the
 /// ones it allocates, held to what its video processor renders where libva answers, since
@@ -518,7 +590,78 @@ struct VaapiSession {
     /// Whether the codec is opened on the low-power (VDENC) entry point. It is tried first: recent
     /// Intel generations expose it as the only one for HEVC, VP9 and AV1, and it is the shorter
     /// path where both exist. A driver without it refuses the open and the default one follows.
+    /// H.264 on a part whose low-power encoder codes one slice a picture (`whole_picture_vdenc`)
+    /// tries the full one first instead.
     low_power: bool,
+    /// The driver's vendor string, empty where libva could not be asked: what tells an Intel
+    /// driver, whose video processor reads a linear surface at a 64-byte pitch, and iHD, whose
+    /// rate control starves in a small buffer.
+    vendor: String,
+    /// Whether the node's low-power H.264 encoder codes a picture as one slice.
+    whole_picture_vdenc: bool,
+    /// libva, for the attribute queries the session makes beside FFmpeg's own.
+    libva: Option<Library>,
+}
+
+impl VaapiSession {
+    /// Whether the driver's video processor reads a linear surface at a pitch rounded up to
+    /// 64 bytes rather than the one its import declares, as Intel's does: such a surface
+    /// converts sheared unless its pitch is already a multiple of 64.
+    fn rounds_linear_pitch(&self) -> bool {
+        self.vendor.contains("Intel")
+    }
+
+    /// Whether the driver's constant rate starves, as Intel's iHD does. Measured on an Arc at
+    /// 1080p and 60 fps, 8 Mbit/s, scrolling text then a still screen: in the frame-and-a-half
+    /// buffer its H.264 and HEVC skip every block and pad each frame with zeros to the target,
+    /// 14 dB that is never refined; in a buffer of a second H.264 codes a scroll at 18 to 38 dB
+    /// and refines the still screen only over seconds while spending 10 to 16 kB a frame on it
+    /// for good. Its quality-targeted variable rate under the same ceiling codes the scroll at
+    /// 23 to 42 dB, refines the still screen to the target within a second, and then sends
+    /// nothing, which is what a desktop wants of a constant rate; its plain variable rate
+    /// refines as well and quiets later.
+    fn starves_in_a_small_buffer(&self) -> bool {
+        self.vendor.contains("iHD")
+    }
+
+    /// The driver's answer for `attribute` of `profile` on the session's entry point, None where
+    /// libva or the driver does not say.
+    unsafe fn config_attribute(&self, profile: c_int, attribute: c_int) -> Option<u32> {
+        let lib = self.libva.as_ref()?;
+        let get: Symbol<VaGetConfigAttributes> = lib.get(b"vaGetConfigAttributes\0").ok()?;
+        let display = va_display(self.hw_device_ctx)?;
+        let entrypoint = if self.low_power { VA_ENTRYPOINT_ENC_SLICE_LP } else { VA_ENTRYPOINT_ENC_SLICE };
+        let mut attr = VaConfigAttrib {
+            type_: attribute,
+            value: VA_ATTRIB_NOT_SUPPORTED,
+        };
+        if get(display, profile, entrypoint, &mut attr, 1) != VA_STATUS_SUCCESS
+            || attr.value == VA_ATTRIB_NOT_SUPPORTED
+        {
+            return None;
+        }
+        Some(attr.value)
+    }
+
+    /// The slice structures the driver takes for `profile` (`VA_ENC_SLICE_STRUCTURE_*`).
+    unsafe fn slice_structure(&self, profile: c_int) -> Option<u32> {
+        self.config_attribute(profile, VA_CONFIG_ATTRIB_ENC_SLICE_STRUCTURE)
+    }
+
+    /// How a constant-rate session of `profile` is driven on this driver (`ConstantRate`).
+    unsafe fn constant_rate(&self, profile: c_int) -> ConstantRate {
+        if !self.starves_in_a_small_buffer() {
+            return ConstantRate::Cbr;
+        }
+        let modes = self.config_attribute(profile, VA_CONFIG_ATTRIB_RATE_CONTROL).unwrap_or(0);
+        if modes & VA_RC_QVBR != 0 {
+            ConstantRate::Qvbr
+        } else if modes & VA_RC_VBR != 0 {
+            ConstantRate::Vbr
+        } else {
+            ConstantRate::Cbr
+        }
+    }
 }
 
 impl Drop for VaapiSession {
@@ -578,6 +721,11 @@ pub struct AvcodecEncoder {
     /// Whether a constant-rate session still names a maximum bitrate. Cleared for good the
     /// first time an encoder refuses to open with one.
     rate_ceiling: bool,
+    /// How the open VA-API session is driven at a constant rate (`ConstantRate`).
+    constant_rate: ConstantRate,
+    /// The quantizer a quality-targeted session refines a still screen to: the finest the
+    /// capture asks for, the paint-over quality where that is in use.
+    quality_target: u32,
     current_bitrate_kbps: i32,
     current_vbv_mult: f64,
     current_kf_s: f64,
@@ -695,6 +843,14 @@ impl AvcodecEncoder {
                 qp_hysteresis_counter: 0,
                 cbr_mode: settings.video_cbr_mode,
                 rate_ceiling: true,
+                constant_rate: ConstantRate::Cbr,
+                quality_target: codec.quantizer(
+                    if settings.use_paint_over_quality && settings.video_paintover_crf < settings.video_crf {
+                        settings.video_paintover_crf
+                    } else {
+                        settings.video_crf
+                    },
+                ),
                 current_bitrate_kbps: settings.video_bitrate_kbps,
                 current_vbv_mult: settings.video_vbv_multiplier,
                 current_kf_s: settings.keyframe_interval_s,
@@ -807,7 +963,7 @@ impl AvcodecEncoder {
         } else {
             "/dev/dri/renderD128".to_string()
         };
-        let device_url = CString::new(render_node).unwrap();
+        let device_url = CString::new(render_node.as_str()).unwrap();
         let mut drm_device_ctx: *mut ff::AVBufferRef = ptr::null_mut();
         let ret = ff::av_hwdevice_ctx_create(
             &mut drm_device_ctx,
@@ -829,6 +985,9 @@ impl AvcodecEncoder {
             buffersink_ctx: ptr::null_mut(),
             filtered_frame: ptr::null_mut(),
             low_power: true,
+            vendor: String::new(),
+            whole_picture_vdenc: whole_picture_vdenc(&render_node),
+            libva: Library::new(LIBVA).ok(),
         };
         let ret = ff::av_hwdevice_ctx_create_derived(
             &mut session.hw_device_ctx,
@@ -838,6 +997,16 @@ impl AvcodecEncoder {
         );
         if ret < 0 {
             return Err(format!("Failed to derive VAAPI device: {}", ff_err_str(ret)));
+        }
+        if let (Some(lib), Some(display)) = (session.libva.as_ref(), va_display(session.hw_device_ctx)) {
+            session.vendor = vendor_string(lib, display);
+        }
+        if self.codec == Codec::H264 && session.whole_picture_vdenc {
+            session.low_power = false;
+            crate::log::debug!(
+                "[vaapi] H.264 tries the full entry point first: this device's low-power \
+                 encoder codes one slice a picture."
+            );
         }
 
         self.sw_format = if fullcolor {
@@ -895,17 +1064,18 @@ impl AvcodecEncoder {
         // shared open to reach.
         self.hw = Some(session);
         let qp = self.current_qp;
-        if let Err(lp) = self.open_codec(qp) {
-            self.hw.as_mut().unwrap().low_power = false;
+        if let Err(first) = self.open_codec(qp) {
+            let session = self.hw.as_mut().unwrap();
+            session.low_power = !session.low_power;
             if let Err(e) = self.open_codec(qp) {
                 return Err(if self.is_fullcolor() {
                     format!(
-                        "Failed to open {} for 4:4:4 ({}): {e}; low-power entry point: {lp}",
+                        "Failed to open {} for 4:4:4 ({}): {e}; the other entry point: {first}",
                         self.library,
                         pix_fmt_name(self.sw_format)
                     )
                 } else {
-                    format!("Failed to open encoder: {e}; low-power entry point: {lp}")
+                    format!("Failed to open encoder: {e}; the other entry point: {first}")
                 });
             }
         }
@@ -1069,7 +1239,7 @@ impl AvcodecEncoder {
             (*ctx).hw_frames_ctx = ff::av_buffer_ref(session.enc_frames_ctx);
             (*ctx).compression_level = 6;
             if matches!(self.codec, Codec::H264 | Codec::H265) {
-                (*ctx).slices = 4;
+                (*ctx).slices = self.vaapi_slices(session);
             }
         } else {
             (*ctx).pix_fmt = self.sw_format;
@@ -1087,8 +1257,31 @@ impl AvcodecEncoder {
             // SVT-AV1 refuses a rate-control buffer shorter than 20 ms, which the 1.5-frame
             // VBV falls under above 75 fps.
             let vbv = if self.library == "svt-av1" { vbv.max(bps / 50) } else { vbv };
+            // FFmpeg sends an HRD with every constant-rate session, so a driver whose rate
+            // control starves in the frame-and-a-half buffer is given a second of the target
+            // for H.264 and HEVC, where upstream measured no bound at all refining a still
+            // screen of text to 46 to 51 dB, and a tenth of one for AV1, which halved its
+            // largest frame; VP8 and VP9 refine in the default buffer and keep it.
+            let vbv = match self.hw.as_ref() {
+                Some(session) if session.starves_in_a_small_buffer() => match self.codec {
+                    Codec::H264 | Codec::H265 => bps,
+                    Codec::Av1 => bps / 10,
+                    _ => vbv,
+                },
+                _ => vbv,
+            };
+            self.constant_rate = match self.hw.as_ref() {
+                Some(session) => self.vaapi_constant_rate(session),
+                None => ConstantRate::Cbr,
+            };
             (*ctx).bit_rate = bps;
-            if self.rate_ceiling {
+            if self.constant_rate != ConstantRate::Cbr {
+                // A variable rate reads a ceiling equal to the target as a constant one.
+                (*ctx).rc_max_rate = bps + 1;
+                if self.constant_rate == ConstantRate::Qvbr {
+                    (*ctx).global_quality = self.quality_target as i32;
+                }
+            } else if self.rate_ceiling {
                 // SVT-AV1 refuses a ceiling equal to the target and wants one strictly above it,
                 // where every other encoder here reads equal bounds as a constant rate.
                 (*ctx).rc_max_rate = if self.library == "svt-av1" { bps + 1 } else { bps };
@@ -1150,6 +1343,62 @@ impl AvcodecEncoder {
         }
     }
 
+    /// The slices an H.264 or HEVC picture is cut into: `SLICES` where the driver cuts rows as
+    /// asked or in powers of two, which FFmpeg's negotiation honors; one where it takes only
+    /// equal rows, which FFmpeg cuts a slice a row, 68 at 1080p, each restarting the entropy
+    /// coder and predicting from nothing above it, at half again the bytes of four at the same
+    /// PSNR; and one on a low-power H.264 encoder that codes a picture as one slice whatever it
+    /// is handed. Where libva does not say, FFmpeg's own negotiation stands.
+    unsafe fn vaapi_slices(&self, session: &VaapiSession) -> c_int {
+        if self.codec == Codec::H264 && session.low_power && session.whole_picture_vdenc {
+            return 1;
+        }
+        let profile = if self.is_fullcolor() {
+            vaapi_fullcolor_profiles(self.codec).first()
+        } else {
+            vaapi_profiles(self.codec).last()
+        };
+        let Some(&profile) = profile else {
+            return SLICES;
+        };
+        let cuts_as_asked = VA_ENC_SLICE_STRUCTURE_ARBITRARY_ROWS
+            | VA_ENC_SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS
+            | VA_ENC_SLICE_STRUCTURE_POWER_OF_TWO_ROWS;
+        let structure = session.slice_structure(profile);
+        let slices = match structure {
+            Some(structure) if structure & cuts_as_asked == 0 => 1,
+            _ => SLICES,
+        };
+        crate::log::debug!(
+            "[vaapi] {} in {slices} slice{} on the {} entry point: the driver cuts {}",
+            self.codec.display(),
+            if slices == 1 { "" } else { "s" },
+            if session.low_power { "low-power" } else { "full" },
+            structure.map_or("what it does not say".to_string(), |s| format!("structure {s:#x}"))
+        );
+        slices
+    }
+
+    /// How this session's constant rate is driven on the driver (`VaapiSession::constant_rate`),
+    /// said once per open.
+    unsafe fn vaapi_constant_rate(&self, session: &VaapiSession) -> ConstantRate {
+        let profile = if self.is_fullcolor() {
+            vaapi_fullcolor_profiles(self.codec).first()
+        } else {
+            vaapi_profiles(self.codec).last()
+        };
+        let mode = profile.map_or(ConstantRate::Cbr, |&p| session.constant_rate(p));
+        if mode != ConstantRate::Cbr {
+            crate::log::debug!(
+                "[vaapi] {} at {} kbit/s as {mode:?}{}: this driver's constant rate skips a still screen",
+                self.codec.display(),
+                self.current_bitrate_kbps,
+                if mode == ConstantRate::Qvbr { format!(" toward quantizer {}", self.quality_target) } else { String::new() }
+            );
+        }
+        mode
+    }
+
     /// The private options of a VA-API session: rate-control mode and quantizer, a single
     /// frame in flight, the profile the surface format implies, the lowest fitting level,
     /// and the low-power entry point when the default one refused.
@@ -1157,7 +1406,15 @@ impl AvcodecEncoder {
         let (w, h, fps) = (self.width as u32, self.height as u32, self.fps as u32);
         let bitrate = self.encoder_ctx.as_ref().map_or(0, |ctx| ctx.bit_rate.max(0) as u64);
         if self.cbr_mode {
-            dict_set(opts, "rc_mode", "CBR");
+            dict_set(
+                opts,
+                "rc_mode",
+                match self.constant_rate {
+                    ConstantRate::Cbr => "CBR",
+                    ConstantRate::Vbr => "VBR",
+                    ConstantRate::Qvbr => "QVBR",
+                },
+            );
         } else {
             dict_set(opts, "rc_mode", "CQP");
             match self.codec {
@@ -1386,6 +1643,12 @@ impl AvcodecEncoder {
         while ff::avcodec_receive_packet(self.encoder_ctx, self.packet) == 0 {
             let size = (*self.packet).size as usize;
             let bytes = std::slice::from_raw_parts((*self.packet).data, size);
+            let bytes = if self.hw.is_some() && self.cbr_mode && matches!(self.codec, Codec::H264 | Codec::H265) {
+                strip_zero_padding(bytes)
+            } else {
+                bytes
+            };
+            let size = bytes.len();
             if !self.omit_stripe_headers {
                 let frame_type = match self.codec {
                     Codec::H264 => h264_frame_type(bytes),
@@ -1501,6 +1764,18 @@ impl AvcodecEncoder {
                 (*desc_ptr).layers[0].planes[i].object_index = if single_object { 0 } else { i as i32 };
                 (*desc_ptr).layers[0].planes[i].offset = offset as isize;
                 (*desc_ptr).layers[0].planes[i].pitch = stride as isize;
+            }
+
+            let pitch = dmabuf.strides().next().unwrap_or(0);
+            if u64::from(dmabuf.format().modifier) == 0
+                && !self.is_fullcolor()
+                && self.hw.as_ref().is_some_and(|s| s.rounds_linear_pitch())
+                && pitch % 64 != 0
+            {
+                return Err(fail(
+                    &resources,
+                    &format!("this VA-API driver reads a linear surface at a 64-byte pitch, not the {pitch} of this dmabuf"),
+                ));
             }
 
             ff::av_frame_unref(self.frame);
@@ -1781,6 +2056,25 @@ mod tests {
 
     /// Every VA-API encoder name this module can ask for is one FFmpeg registers, whether or
     /// not a device exists to run it.
+    /// The Skylake and Broxton ids name those parts alone, and a node that is not under
+    /// `/sys/class/drm` is not one of them.
+    #[test]
+    fn whole_picture_vdenc_names_skylake_and_broxton() {
+        assert!(skylake_or_broxton(0x1912) && skylake_or_broxton(0x5a85));
+        assert!(!skylake_or_broxton(0x3e92) && !skylake_or_broxton(0x56a0));
+        assert!(!whole_picture_vdenc("/dev/dri/renderD999"));
+    }
+
+    /// The padding cut ends at the stop bit of the last NAL unit; a frame without any is
+    /// kept whole, and so is one that ends in a cabac_zero_word.
+    #[test]
+    fn zero_padding_is_cut_behind_the_last_nal_unit() {
+        assert_eq!(strip_zero_padding(&[0, 0, 1, 0x65, 0x88, 0x80, 0, 0, 0, 0]), &[0, 0, 1, 0x65, 0x88, 0x80]);
+        assert_eq!(strip_zero_padding(&[0, 0, 1, 0x65, 0x88, 0x80]), &[0, 0, 1, 0x65, 0x88, 0x80]);
+        assert_eq!(strip_zero_padding(&[0, 0, 1, 0x65, 0x80, 0, 0, 3, 0, 0]), &[0, 0, 1, 0x65, 0x80, 0, 0, 3]);
+        assert!(strip_zero_padding(&[0, 0, 0]).is_empty());
+    }
+
     #[test]
     fn vaapi_encoder_names_are_registered() {
         for codec in Codec::VIDEO {
@@ -1902,6 +2196,103 @@ mod tests {
     /// Construction either stands a session up or says why it could not; a half-built
     /// encoder must never reach a caller, and a session never quietly changes chroma. Runs
     /// everywhere: a host without a VA-API device exercises the error path.
+    /// Prints what a VA-API constant-rate H.264 and HEVC session spends on a scrolling screen
+    /// of text at 1080p and how many slices it cuts a frame into, for the slice decision
+    /// (`vaapi_slices`) to be measured against the driver's own rounding: a driver that takes
+    /// only equal rows is cut a slice a row by FFmpeg when asked for four.
+    #[test]
+    #[ignore]
+    fn gpu_bench_vaapi_slice_cost() {
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        const W: usize = 1920;
+        const H: usize = 1080;
+        const FRAMES: u64 = 60;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut cell = |x: usize, y: usize| {
+            seed ^= ((x / 8) as u64) << 32 ^ (y / 8) as u64 ^ seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) & 0xff
+        };
+        let dense = std::env::var("PF_BENCH_DENSE").is_ok();
+        let text: Vec<u8> = (0..H * 2)
+            .flat_map(|y| (0..W).map(move |x| (x, y)))
+            .flat_map(|(x, y)| {
+                let ink = if dense {
+                    cell(x, y) < 96 && (x % 8) > 1 && (y % 8) > 1
+                } else {
+                    (y % 20) >= 4 && (y % 20) < 14 && (x % 10) >= 2 && (x % 10) < 8 && cell(x, y) < 40
+                };
+                let v = if ink { 20u8 } else { 245u8 };
+                [v, v, v, 255]
+            })
+            .collect();
+        for (codec, cbr) in [(Codec::H264, false), (Codec::H264, true), (Codec::H265, false), (Codec::H265, true)] {
+            let settings = RustCaptureSettings {
+                width: W as c_int,
+                height: H as c_int,
+                target_fps: 60.0,
+                codec,
+                video_cbr_mode: cbr,
+                video_bitrate_kbps: 8000,
+                debug_logging: true,
+                ..Default::default()
+            };
+            let mode = if cbr { "8000 kbit/s" } else { "quantizer 25" };
+            let mut enc = match AvcodecEncoder::new(&settings, codec, Backend::Vaapi, Input::Host { rgba: false }) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    println!("[slices] {codec:?} at {mode}: no VA-API session ({e})");
+                    continue;
+                }
+            };
+            let mut slices = 0usize;
+            let mut dec = AvDecoder::new(codec).expect("decoder");
+            let mut segment = 0usize;
+            let mut report = String::new();
+            for t in 0..FRAMES * 5 {
+                let from = (t.min(FRAMES - 1) as usize * 4) * W * 4;
+                let out = enc
+                    .encode_host(&text[from..from + W * H * 4], W * 4, t, 25, t == 0)
+                    .unwrap_or_else(|e| panic!("encode: {e}"));
+                if t == 0 {
+                    let is_slice = |i: usize| match codec {
+                        Codec::H264 => matches!(out[i] & 0x1f, 1 | 5),
+                        _ => matches!((out[i] >> 1) & 0x3f, 0..=9 | 16..=21),
+                    };
+                    slices = (0..out.len().saturating_sub(4))
+                        .filter(|&i| out[i..i + 3] == [0, 0, 1] && is_slice(i + 3))
+                        .count();
+                }
+                segment += out.len();
+                let decoded = dec.decode(&out[VIDEO_HEADER_LEN..]).unwrap_or(false);
+                if (t + 1) % FRAMES == 0 {
+                    let psnr = match dec.frame() {
+                        Some(f) if decoded => {
+                            let sse: f64 = (0..H)
+                                .step_by(4)
+                                .flat_map(|y| (0..W).map(move |x| (x, y)))
+                                .map(|(x, y)| {
+                                    let src = 16.0 + text[from + (y * W + x) * 4] as f64 * 219.0 / 255.0;
+                                    (f.y[y * f.y_stride + x] as f64 - src).powi(2)
+                                })
+                                .sum();
+                            10.0 * (255.0f64.powi(2) / (sse / (W * H / 4) as f64)).log10()
+                        }
+                        _ => f64::NAN,
+                    };
+                    report.push_str(&format!(
+                        " | {} {} kB/frame {psnr:.1} dB",
+                        if t < FRAMES { "scroll" } else { "still" },
+                        segment / FRAMES as usize / 1000
+                    ));
+                    segment = 0;
+                }
+            }
+            println!("[slices] {codec:?} at {mode}: {slices} slices{report}");
+        }
+    }
+
     #[test]
     fn vaapi_construction_answers_or_refuses() {
         let mut settings = RustCaptureSettings {
